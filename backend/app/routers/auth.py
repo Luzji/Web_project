@@ -66,7 +66,11 @@ def wallet_verify(data: WalletVerify, user: User = Depends(current_user), db: Se
     try: recovered = recover_address(build_message(user.email, data.nonce), data.signature)
     except Exception as exc: raise HTTPException(400, "Chữ ký không hợp lệ") from exc
     if recovered.lower() != data.wallet_address.lower(): raise HTTPException(400, "Chữ ký không khớp địa chỉ ví")
-    user.wallet_address = Web3.to_checksum_address(data.wallet_address)
+    checksum_address = Web3.to_checksum_address(data.wallet_address)
+    existing = db.scalar(select(User).where(User.wallet_address == checksum_address, User.id != user.id))
+    if existing:
+        raise HTTPException(409, "Địa chỉ ví đã được liên kết với tài khoản khác")
+    user.wallet_address = checksum_address
     user.wallet_verified_at = datetime.now(timezone.utc); user.wallet_nonce = None; user.wallet_nonce_expires_at = None
     db.commit()
     return Token(access_token=create_token(str(user.id)))
