@@ -1,4 +1,4 @@
-import re
+import os, re
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -9,6 +9,10 @@ class InvalidWrittenWorkError(ValueError):
     pass
 
 
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "100"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "2000000"))
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("\ufeff", " ")).strip()
 
@@ -17,10 +21,22 @@ def extract_written_content(path: Path, media_type: str) -> tuple[str, int]:
     try:
         if media_type == "pdf":
             reader = PdfReader(str(path))
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            if len(reader.pages) > MAX_PDF_PAGES:
+                raise InvalidWrittenWorkError("PDF vượt quá số trang cho phép")
+            chunks = []
+            total_chars = 0
+            for page in reader.pages:
+                chunk = page.extract_text() or ""
+                total_chars += len(chunk)
+                if total_chars > MAX_TEXT_CHARS:
+                    raise InvalidWrittenWorkError("Nội dung văn bản vượt quá giới hạn cho phép")
+                chunks.append(chunk)
+            text = "\n".join(chunks)
             page_count = len(reader.pages)
         else:
             text = path.read_text(encoding="utf-8")
+            if len(text) > MAX_TEXT_CHARS:
+                raise InvalidWrittenWorkError("Nội dung văn bản vượt quá giới hạn cho phép")
             page_count = 1
     except Exception as exc:
         raise InvalidWrittenWorkError("Không thể đọc nội dung tác phẩm viết") from exc

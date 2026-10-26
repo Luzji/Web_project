@@ -70,7 +70,7 @@ def parse_artwork(row: Artwork, *, viewer: User | None = None) -> ArtworkOut:
     return ArtworkOut(
         id=row.id, title=row.title, description=row.description, tags=json.loads(row.tags or "[]"),
         sha256=row.sha256, phash=row.phash, originality=row.originality, status=row.status,
-        tx_hash=row.tx_hash, image_url=media_url(row.file_path) if media_type == "image" else None,
+        tx_hash=row.tx_hash, image_url=media_url(row.file_path) if media_type == "image" and visibility == "public" else None,
         download_url=f"/api/artworks/{row.id}/download" if bool(getattr(row, "allow_download", False)) and visibility == "public" else None,
         author_email=row.owner.email if row.show_contact_email else None,
         author_wallet=row.owner.wallet_address, media_type=media_type,
@@ -136,6 +136,29 @@ def _safe_transaction_proof(tx_hash: str | None) -> dict[str, int | None] | None
 def list_artworks(viewer: User | None = Depends(optional_current_user), db: Session = Depends(get_db)):
     rows = db.scalars(select(Artwork).where(Artwork.visibility == "public").order_by(Artwork.created_at.desc())).all()
     return [parse_artwork(x, viewer=viewer) for x in rows]
+
+
+@router.get("/media/{filename:path}")
+def serve_media(filename: str, viewer: User | None = Depends(optional_current_user), db: Session = Depends(get_db)):
+    """Serve previews only after applying the artwork visibility policy."""
+    if not filename or Path(filename).name != filename:
+        raise HTTPException(404, "Không tìm thấy file tác phẩm")
+    row = db.scalar(select(Artwork).where(Artwork.file_path.endswith(f"/{filename}")))
+    if not row or (row.visibility != "public" and not (viewer and viewer.id == row.owner_id)):
+        raise HTTPException(404, "Không tìm thấy file tác phẩm")
+    if is_remote(row.file_path):
+        if row.visibility != "public":
+            raise HTTPException(404, "Không tìm thấy file tác phẩm")
+        return RedirectResponse(row.file_path)
+    path = Path(row.file_path).resolve()
+    root = UPLOAD_DIR.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        raise HTTPException(404, "Không tìm thấy file tác phẩm")
+    if not path.is_file():
+        raise HTTPException(404, "Không tìm thấy file tác phẩm")
+    return FileResponse(path, media_type="application/octet-stream")
 
 
 @router.get("/artworks/{artwork_id}", response_model=WorkDetailOut)
@@ -210,7 +233,9 @@ async def register_artwork(
             label = "văn bản" if media_type == "written" else "ảnh"
             raise HTTPException(409, {"message": f"{label.capitalize()} quá giống tác phẩm đã đăng ký", "similarity_percent": best, "suspected_artwork_id": nearest.id})
         stored_path = str(target)
-        if cloud_enabled():
+        # Cloudinary uploads in this project use public delivery URLs. Keep private
+        # works on the protected local path until authenticated/signed delivery is added.
+        if cloud_enabled() and visibility == "public":
             try:
                 stored_path = await run_in_threadpool(upload_file, target, media_type)
             except Exception as exc:
@@ -248,7 +273,7 @@ async def register_artwork(
 
 
 @router.post("/verify", response_model=VerifyResult)
-async def verify_artwork(request: Request, file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def verify_artwork(request: Request, file: UploadFile = File(...), viewer: User | None = Depends(optional_current_user), db: Session = Depends(get_db)):
     client_ip = request.client.host if request.client else "unknown"
     if not VERIFY_LIMITER.allow(f"verify:{client_ip}"):
         raise HTTPException(429, "Quá nhiều lượt verify, vui lòng thử lại sau")
@@ -260,6 +285,12 @@ async def verify_artwork(request: Request, file: UploadFile = File(...), db: Ses
         if exact:
             on_chain = await run_in_threadpool(_safe_verify_on_chain, sha)
             proof = await run_in_threadpool(_safe_transaction_proof, exact.tx_hash) if on_chain else None
+            can_view = exact.visibility == "public" or bool(viewer and viewer.id == exact.owner_id)
+            if not can_view:
+                return VerifyResult(
+                    sha256=sha, registered=True, similarity_percent=100, on_chain_registered=on_chain,
+                    message="File đã tồn tại trong hệ thống nhưng thông tin tác phẩm được bảo vệ theo chế độ riêng tư.", media_type=media_type,
+                )
             return VerifyResult(
                 sha256=sha, registered=True, artwork_id=exact.id, similarity_percent=100,
                 on_chain_registered=on_chain, message="Mã SHA-256 của file khớp hoàn toàn với tác phẩm đã đăng ký. File này giống hệt bản gốc.", media_type=media_type,
@@ -273,6 +304,8 @@ async def verify_artwork(request: Request, file: UploadFile = File(...), db: Ses
         if media_type == "image":
             phash = phash_file(target)
             for row in db.scalars(select(Artwork).where(Artwork.media_type == "image")).all():
+                if row.visibility != "public" and not (viewer and viewer.id == row.owner_id):
+                    continue
                 if row.phash:
                     score = similarity_percent(phash, row.phash)
                     if score > best: best, nearest = score, row
@@ -282,6 +315,8 @@ async def verify_artwork(request: Request, file: UploadFile = File(...), db: Ses
             except InvalidWrittenWorkError as exc:
                 raise HTTPException(415, str(exc)) from exc
             for row in db.scalars(select(Artwork).where(Artwork.media_type == "written")).all():
+                if row.visibility != "public" and not (viewer and viewer.id == row.owner_id):
+                    continue
                 score = text_similarity(content_text, row.content_text)
                 if score > best: best, nearest = score, row
         return VerifyResult(

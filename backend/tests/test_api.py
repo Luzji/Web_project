@@ -144,6 +144,34 @@ def test_verify_exact_private_image_has_no_public_thumbnail(monkeypatch):
     assert response.status_code == 200, response.text
     assert response.json()["registered"] is True
     assert response.json()["matched_image_url"] is None
+    assert response.json().get("matched_title") is None
+    assert response.json().get("matched_wallet") is None
+
+
+def test_private_media_and_similarity_metadata_are_not_public(monkeypatch):
+    db = SessionLocal()
+    password = "correct-horse-battery-staple"
+    owner = User(email=f"private-media-{uuid4().hex}@example.com", password_hash=hash_password(password))
+    db.add(owner); db.commit(); db.refresh(owner)
+    filename = f"private-{uuid4().hex}.png"
+    path = artwork_router.UPLOAD_DIR / filename
+    path.write_bytes(png_bytes("black"))
+    artwork = Artwork(
+        owner_id=owner.id, file_path=str(path), sha256=uuid4().hex * 2,
+        phash="c" * 16, title="Secret private work", originality=100,
+        status="approved_local", media_type="image", visibility="private",
+    )
+    db.add(artwork); db.commit(); db.refresh(artwork)
+    artwork_id = artwork.id
+    db.close()
+
+    assert client.get(f"/media/{filename}").status_code == 404
+    monkeypatch.setattr(artwork_router, "phash_file", lambda _path: "c" * 16)
+    response = client.post("/verify", files={"file": ("candidate.png", png_bytes("white"), "image/png")})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["suspected_artwork_title"] != "Secret private work"
+    assert client.get(f"/artworks/{artwork_id}").status_code == 404
 
 
 def test_metamask_signature_and_nonce_errors():
@@ -195,7 +223,7 @@ def test_register_written_work_with_public_preview(monkeypatch):
     token = register.json()["access_token"]
     db = SessionLocal()
     user = db.scalar(select(User).where(User.email == email))
-    user.wallet_address = "0x0000000000000000000000000000000000000001"
+    user.wallet_address = "0x" + uuid4().hex + uuid4().hex[:8]
     user.wallet_verified_at = datetime.now(timezone.utc)
     db.commit(); db.close()
     monkeypatch.setattr(artwork_router, "register_on_chain", lambda *args: None)
